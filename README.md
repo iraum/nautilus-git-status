@@ -159,7 +159,7 @@ extension:
 1. Skips anything that isn't a local directory containing a `.git`
    (directory or file — worktrees and submodules count).
 2. On a cache miss, runs `git status --porcelain=v2 --branch`
-   synchronously (2-second timeout) and stores the resulting emblem.
+   synchronously (1-second timeout) and stores the resulting emblem.
    `git status` on a healthy repo is fast — tens of milliseconds —
    so the first render of a parent dir with N repos costs ~N quick
    git invocations. Subsequent renders are cache hits.
