@@ -167,6 +167,36 @@ folder → Properties → Git for the rich view.
   by scanning section names for any starting with `remote `. We
   don't follow `[include]` directives — if a user puts user info in
   an included file, the subprocess fallback handles it.
+- **Monitor-driven invalidations are debounced (1.5s).** Git operations
+  like pull / fetch / checkout / rebase write many files into `.git/`
+  in fast bursts; without debouncing, each file event would schedule
+  its own `invalidate_extension_info()` and Nautilus would re-call us
+  10+ times per operation, each forcing a fresh `git status` fork.
+  `_on_git_changed` drops the cache *synchronously* (so the user can
+  never observe stale data) but defers the actual invalidate via a
+  per-path `GLib.timeout_add`. New events for the same path cancel
+  the pending source and reschedule. The visible cost is ~1.5s of lag
+  between a CLI git operation and the emblem updating, which is
+  imperceptible at human workflow scale. The config-change path
+  bypasses the debounce (uses `_invalidate` directly) because user
+  edits to `profiles.conf` should refresh promptly; it cancels any
+  pending debounced invalidates first to avoid duplicate work.
+- **Right-click / Properties metadata is TTL-cached (5s).**
+  `_gather_git_info` is called on every right-click and Properties
+  open; without a TTL, hovering between submenu items or closing-and-
+  reopening the dialog re-forks `git status` and `git log`. The TTL
+  cache (`_info_cache`) is busted synchronously by `_on_git_changed`,
+  so it can never serve info older than the most recently observed
+  `.git/` change. Distinct from `_cache` (the emblem cache) because
+  the menu / Properties surfaces want richer fields than the emblem
+  needs — keeping them separate preserves the "different surfaces,
+  different lifetimes" principle while still deduping rapid reopens.
+- **`GIT_TIMEOUT_SEC = 1`.** A healthy `git status` returns in tens of
+  ms; the timeout primarily bounds how long a stuck or slow-FS repo
+  can freeze the Nautilus main thread (since `update_file_info` is
+  synchronous by design). 2s was overgenerous and let pathological
+  cases stall the UI noticeably; 1s gives 10–20× headroom over
+  typical cost while halving the worst case.
 - **`git status` runs with `--no-renames` and parses lazily.** Rename
   detection is wasted work: we only need a dirty bit, not which
   file was renamed to which. The parser also breaks out of the

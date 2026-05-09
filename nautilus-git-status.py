@@ -45,6 +45,7 @@ import configparser
 import os
 import subprocess
 import threading
+import time
 from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
@@ -57,7 +58,25 @@ from gi.repository import Nautilus, GObject, GLib, Gio, Gtk  # noqa: E402
 
 
 GIT_BIN = 'git'
-GIT_TIMEOUT_SEC = 2
+# 1s is generous: a healthy `git status` returns in tens of ms. The hard
+# ceiling here mostly bounds how long a stuck or slow-FS repo can freeze
+# the Nautilus main thread (update_file_info is synchronous by design).
+GIT_TIMEOUT_SEC = 1
+
+# After a .git/ change, wait this long before the emblem actually
+# refreshes. Git operations (pull / fetch / checkout / rebase) write
+# many files in fast bursts; debouncing collapses those bursts into a
+# single status run instead of 5–20 of them. The user-perceptible cost
+# is that emblems lag ~1.5s behind a CLI git operation; the win is
+# avoiding redundant `git status` forks during that operation.
+INVALIDATE_DEBOUNCE_MS = 1500
+
+# Right-click and Properties dialogs cache their gathered info briefly
+# so rapid repeat opens (or hovering between submenu items) don't
+# re-fork `git status` and `git log`. File-monitor events bust this
+# cache synchronously, so it can never serve info older than the most
+# recent observed .git/ change.
+INFO_TTL_SEC = 5.0
 
 # Hard cap on tracked repos (cache + FileInfo + Gio.FileMonitor). Without
 # this, browsing through many parent folders monotonically grows the
@@ -146,10 +165,18 @@ class GitEmblemsProvider(GObject.GObject,
     def __init__(self):
         super().__init__()
         # _files is the LRU driver: insertion order = recency, oldest first.
-        # _cache and _monitors are evicted in lockstep with _files.
+        # _cache, _monitors, _info_cache, _pending_invalidations all evicted
+        # in lockstep with _files.
         self._cache = {}                  # path -> list[str] emblem names
         self._files = OrderedDict()       # path -> Nautilus.FileInfo (LRU)
         self._monitors = {}               # path -> [Gio.FileMonitor, ...]
+        # path -> GLib timeout source id. At most one debounced refresh
+        # pending per path; new events cancel and reschedule.
+        self._pending_invalidations = {}
+        # path -> (monotonic_ts, info_dict). Backs the right-click /
+        # Properties TTL cache. Distinct from _cache because the menu /
+        # dialog need richer fields than the emblem does.
+        self._info_cache = OrderedDict()
         self._lock = threading.Lock()
         self._owner_map = _load_owner_config(CONFIG_PATH)
         self._config_monitor = None
@@ -172,17 +199,27 @@ class GitEmblemsProvider(GObject.GObject,
             self._files[path] = file
             self._files.move_to_end(path)  # mark as most-recently-used
             cached = self._cache.get(path)
-            # Evict LRU repos beyond the cap. Defer monitor.cancel() until
-            # after we drop the lock — Gio calls shouldn't run under it.
+            # Evict LRU repos beyond the cap. Defer Gio / GLib calls until
+            # after we drop the lock — those shouldn't run under it.
             evicted_monitors = []
+            evicted_sources = []
             while len(self._files) > MAX_TRACKED_REPOS:
                 old_path, _ = self._files.popitem(last=False)
                 self._cache.pop(old_path, None)
+                self._info_cache.pop(old_path, None)
                 evicted_monitors.extend(self._monitors.pop(old_path, []))
+                src = self._pending_invalidations.pop(old_path, None)
+                if src is not None:
+                    evicted_sources.append(src)
 
         for mon in evicted_monitors:
             try:
                 mon.cancel()
+            except Exception:
+                pass
+        for src in evicted_sources:
+            try:
+                GLib.source_remove(src)
             except Exception:
                 pass
 
@@ -269,13 +306,39 @@ class GitEmblemsProvider(GObject.GObject,
             self._monitors[path] = monitors
 
     def _on_git_changed(self, monitor, gfile, other_file, event_type, path):
+        # Drop caches synchronously so the user can never observe stale
+        # data once a change has happened. The actual emblem refresh
+        # (which costs a `git status` fork) is deferred behind a
+        # debounce so a burst of writes coalesces into one status run.
         with self._lock:
             self._cache.pop(path, None)
+            self._info_cache.pop(path, None)
+            old_source = self._pending_invalidations.pop(path, None)
+        if old_source is not None:
+            try:
+                GLib.source_remove(old_source)
+            except Exception:
+                pass
+        new_source = GLib.timeout_add(
+            INVALIDATE_DEBOUNCE_MS, self._fire_invalidate, path,
+        )
+        with self._lock:
+            self._pending_invalidations[path] = new_source
+
+    def _fire_invalidate(self, path):
+        with self._lock:
+            self._pending_invalidations.pop(path, None)
             file = self._files.get(path)
         if file is not None:
-            GLib.idle_add(self._invalidate, file)
+            try:
+                file.invalidate_extension_info()
+            except Exception:
+                pass
+        return False  # one-shot
 
     def _invalidate(self, file):
+        # Immediate path used by config-change refreshes. The git-monitor
+        # path goes through _fire_invalidate so it can be debounced.
         try:
             file.invalidate_extension_info()
         except Exception:
@@ -303,6 +366,17 @@ class GitEmblemsProvider(GObject.GObject,
         with self._lock:
             paths = list(self._files.keys())
             self._cache.clear()
+            self._info_cache.clear()
+            # We're about to fire immediate invalidations for every
+            # tracked path; cancel any pending debounced ones so they
+            # don't fire afterwards as duplicates.
+            pending = list(self._pending_invalidations.values())
+            self._pending_invalidations.clear()
+        for src in pending:
+            try:
+                GLib.source_remove(src)
+            except Exception:
+                pass
         for p in paths:
             f = self._files.get(p)
             if f is not None:
@@ -435,6 +509,25 @@ class GitEmblemsProvider(GObject.GObject,
         )]
 
     def _gather_git_info(self, path):
+        # Short-TTL cache to dedupe rapid reopens (right-click → menu →
+        # close → right-click again, or hovering between submenu items).
+        # File-monitor events bust this cache synchronously, so we
+        # never serve info older than the last observed .git/ change.
+        now = time.monotonic()
+        with self._lock:
+            cached = self._info_cache.get(path)
+            if cached is not None and now - cached[0] < INFO_TTL_SEC:
+                self._info_cache.move_to_end(path)
+                return cached[1]
+        info = self._compute_git_info(path)
+        with self._lock:
+            self._info_cache[path] = (now, info)
+            self._info_cache.move_to_end(path)
+            while len(self._info_cache) > MAX_TRACKED_REPOS:
+                self._info_cache.popitem(last=False)
+        return info
+
+    def _compute_git_info(self, path):
         info = {
             'branch': None, 'upstream': None,
             'ahead': 0, 'behind': 0,
