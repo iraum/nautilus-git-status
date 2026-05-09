@@ -134,11 +134,46 @@ folder → Properties → Git for the rich view.
   needs — shrink or grow the *content* within the 64-canvas, never
   the canvas itself, so the rendered output stays sharp and the
   four dots remain visually identical in size.
-- **Cache + monitor pair is per-repo path.** `_cache`, `_files`, and
-  `_monitors` are dicts keyed by absolute folder path. Don't replace
-  path keys with FileInfo refs — Nautilus FileInfo objects can be
-  transient, but the path is stable, and we want monitor callbacks
-  to find the latest live FileInfo for that path via `_files[path]`.
+- **Cache + monitor pair is per-repo path, LRU-capped.** `_cache`,
+  `_files`, and `_monitors` are dicts keyed by absolute folder path.
+  Don't replace path keys with FileInfo refs — Nautilus FileInfo
+  objects can be transient, but the path is stable, and we want
+  monitor callbacks to find the latest live FileInfo for that path
+  via `_files[path]`. `_files` is an `OrderedDict` driving an LRU
+  with a `MAX_TRACKED_REPOS` cap (256). Without a cap, browsing
+  through many parent folders monotonically grows the inotify watch
+  count and eventually starves every other watcher in the user's
+  session (default per-user limit ~8192). On eviction we
+  `monitor.cancel()` each `Gio.FileMonitor`, releasing the kernel
+  watch; the next visit reinstates them.
+- **`GIT_OPTIONAL_LOCKS=0` is set on every git subprocess.** Without
+  it, `git status` takes the index lock to refresh the stat-cache
+  and rewrites `.git/index` — which our `Gio.FileMonitor` on `.git/`
+  sees, drops the cache, and triggers another status on the next
+  render. A self-fed loop. The env var also keeps us from fighting
+  concurrent CLI git invocations holding `index.lock`. Set once as
+  module-level `GIT_ENV` and passed to every `subprocess` call.
+- **Owner identification reads `.git/config` directly.** `_identify`
+  used to fork four times (`git remote`, `git remote get-url
+  origin`, `git config user.name`, `git config user.email`); now it
+  parses `.git/config` with `configparser` and only falls back to a
+  `git config` subprocess for `user.name` / `user.email` when the
+  local config doesn't have them (so `~/.gitconfig` and XDG global
+  config still resolve correctly via git's include hierarchy). The
+  common path — a cloned repo with a parseable origin slug —
+  drops to **zero** subprocesses for ownership detection. The
+  `[remote "origin"]` subsection header becomes the configparser
+  section name `remote "origin"` verbatim; `has_remote` is detected
+  by scanning section names for any starting with `remote `. We
+  don't follow `[include]` directives — if a user puts user info in
+  an included file, the subprocess fallback handles it.
+- **`git status` runs with `--no-renames` and parses lazily.** Rename
+  detection is wasted work: we only need a dirty bit, not which
+  file was renamed to which. The parser also breaks out of the
+  porcelain-v2 line loop as soon as we've seen `# branch.ab` and
+  any dirty entry — branch.ab always precedes file entries in v2
+  output, so on huge dirty trees we stop after the first dirty
+  line instead of scanning thousands of file entries.
 - **Properties → Git tab does its own git calls,** not the cached
   emblem result. The dialog is opened on-demand, so a fresh
   `git status` / `git log` / `git remote` is cheap and gives the

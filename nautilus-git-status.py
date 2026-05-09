@@ -41,9 +41,11 @@ Implementation:
     Going synchronous removes the race.
 """
 
+import configparser
 import os
 import subprocess
 import threading
+from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
 import gi
@@ -56,6 +58,20 @@ from gi.repository import Nautilus, GObject, GLib, Gio, Gtk  # noqa: E402
 
 GIT_BIN = 'git'
 GIT_TIMEOUT_SEC = 2
+
+# Hard cap on tracked repos (cache + FileInfo + Gio.FileMonitor). Without
+# this, browsing through many parent folders monotonically grows the
+# inotify watch count, eventually starving every other watcher in the
+# user's session (default per-user limit ~8192). LRU eviction cancels the
+# oldest repos' monitors; the next visit reinstates them.
+MAX_TRACKED_REPOS = 256
+
+# GIT_OPTIONAL_LOCKS=0 stops `git status` from taking the index lock to
+# refresh the stat-cache. Without it, every status call rewrites
+# .git/index, which our Gio.FileMonitor on .git/ sees, which drops our
+# cache, which makes the next render run status again — a self-fed loop.
+# Also avoids fighting concurrent CLI git invocations for the same lock.
+GIT_ENV = {**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}
 
 CONFIG_PATH = os.path.expanduser(
     '~/.config/nautilus-git-status/profiles.conf'
@@ -129,9 +145,11 @@ class GitEmblemsProvider(GObject.GObject,
                          Nautilus.MenuProvider):
     def __init__(self):
         super().__init__()
-        self._cache = {}      # path -> list[str] emblem names
-        self._files = {}      # path -> Nautilus.FileInfo (for invalidation)
-        self._monitors = {}   # path -> [Gio.FileMonitor, ...]
+        # _files is the LRU driver: insertion order = recency, oldest first.
+        # _cache and _monitors are evicted in lockstep with _files.
+        self._cache = {}                  # path -> list[str] emblem names
+        self._files = OrderedDict()       # path -> Nautilus.FileInfo (LRU)
+        self._monitors = {}               # path -> [Gio.FileMonitor, ...]
         self._lock = threading.Lock()
         self._owner_map = _load_owner_config(CONFIG_PATH)
         self._config_monitor = None
@@ -152,7 +170,21 @@ class GitEmblemsProvider(GObject.GObject,
 
         with self._lock:
             self._files[path] = file
+            self._files.move_to_end(path)  # mark as most-recently-used
             cached = self._cache.get(path)
+            # Evict LRU repos beyond the cap. Defer monitor.cancel() until
+            # after we drop the lock — Gio calls shouldn't run under it.
+            evicted_monitors = []
+            while len(self._files) > MAX_TRACKED_REPOS:
+                old_path, _ = self._files.popitem(last=False)
+                self._cache.pop(old_path, None)
+                evicted_monitors.extend(self._monitors.pop(old_path, []))
+
+        for mon in evicted_monitors:
+            try:
+                mon.cancel()
+            except Exception:
+                pass
 
         if cached is None:
             cached = self._compute_emblems(path)
@@ -166,14 +198,14 @@ class GitEmblemsProvider(GObject.GObject,
 
     # ---- file monitoring ----------------------------------------------------
 
-    def _ensure_monitor(self, path):
-        with self._lock:
-            if path in self._monitors:
-                return
-            self._monitors[path] = []  # placeholder to dedupe concurrent calls
+    def _resolve_git_dir(self, path):
+        """Return the absolute git directory for a working tree.
 
-        # Resolve actual git directory — for worktrees / submodules, .git is
-        # a file containing "gitdir: <path>" pointing elsewhere.
+        For ordinary repos this is `<path>/.git`. For worktrees and
+        submodules, `.git` is a text file containing `gitdir: <path>` —
+        follow the pointer (resolving relative paths) to find the real
+        git directory.
+        """
         git_path = os.path.join(path, '.git')
         if os.path.isfile(git_path):
             try:
@@ -183,10 +215,41 @@ class GitEmblemsProvider(GObject.GObject,
                     gd = line[len('gitdir: '):].strip()
                     if not os.path.isabs(gd):
                         gd = os.path.normpath(os.path.join(path, gd))
-                    git_path = gd
+                    return gd
             except OSError:
                 pass
+        return git_path
 
+    def _read_git_config(self, path):
+        """Parse the repo's `.git/config` and return a ConfigParser.
+
+        Returns an empty parser on any error. Lets us read remote URLs and
+        local user.name / user.email without forking `git config` —
+        eliminates 2-3 subprocesses on the cold render path. We don't
+        follow `[include]` directives or read global ~/.gitconfig here;
+        callers must fall back to `git config` for values that may live
+        in user-global config (typically user.name / user.email).
+        """
+        parser = configparser.ConfigParser(
+            strict=False,
+            interpolation=None,
+            comment_prefixes=('#', ';'),
+        )
+        cfg_path = os.path.join(self._resolve_git_dir(path), 'config')
+        try:
+            with open(cfg_path, 'r') as fh:
+                parser.read_file(fh)
+        except (OSError, configparser.Error):
+            pass
+        return parser
+
+    def _ensure_monitor(self, path):
+        with self._lock:
+            if path in self._monitors:
+                return
+            self._monitors[path] = []  # placeholder to dedupe concurrent calls
+
+        git_path = self._resolve_git_dir(path)
         monitors = []
         # .git/ root catches HEAD, index, FETCH_HEAD, packed-refs, config.
         # refs/heads + refs/remotes catch branch updates that don't touch root.
@@ -261,8 +324,10 @@ class GitEmblemsProvider(GObject.GObject,
     def _compute_status(self, path):
         try:
             out = subprocess.check_output(
-                [GIT_BIN, '-C', path, 'status', '--porcelain=v2', '--branch'],
+                [GIT_BIN, '-C', path, 'status', '--porcelain=v2', '--branch',
+                 '--no-renames'],
                 stderr=subprocess.DEVNULL, timeout=GIT_TIMEOUT_SEC,
+                env=GIT_ENV,
             ).decode('utf-8', 'replace')
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 FileNotFoundError):
@@ -270,6 +335,7 @@ class GitEmblemsProvider(GObject.GObject,
 
         ahead = behind = 0
         dirty = False
+        saw_branch_ab = False
         for line in out.splitlines():
             if line.startswith('# branch.ab '):
                 parts = line.split()
@@ -279,9 +345,15 @@ class GitEmblemsProvider(GObject.GObject,
                         behind = int(parts[3].lstrip('-'))
                     except ValueError:
                         pass
+                saw_branch_ab = True
             elif line and not line.startswith('#'):
                 # Tracked-modified, staged, untracked (?), unmerged — all dirty.
                 dirty = True
+                # branch.ab always precedes file entries in v2 output, so
+                # once we have it and any dirty line we know the answer.
+                # Skips parsing thousands of file lines on huge dirty trees.
+                if saw_branch_ab:
+                    break
 
         if dirty:
             return 'dirty'
@@ -307,21 +379,34 @@ class GitEmblemsProvider(GObject.GObject,
         from source because a repo can have a non-origin remote (e.g. only
         an "upstream" remote configured) — that still counts as "has a
         remote" for the visual no-remote signal.
+
+        Reads `.git/config` directly to skip 2-3 subprocesses on the cold
+        render path. Falls back to `git config` only for user.name /
+        user.email when they aren't set locally — those typically live
+        in ~/.gitconfig and need git's include resolution.
         """
-        remotes = self._run_git(path, ['remote']).strip()
-        has_remote = bool(remotes)
-        url = self._run_git(path, ['remote', 'get-url', 'origin']).strip()
+        cfg = self._read_git_config(path)
+        # `.git/config` uses `[remote "<name>"]` subsection headers; the
+        # whole quoted form becomes the configparser section name.
+        has_remote = any(s.startswith('remote ') for s in cfg.sections())
+        url = ''
+        if cfg.has_section('remote "origin"'):
+            url = cfg.get('remote "origin"', 'url', fallback='').strip()
         if url:
             slug = _parse_origin_owner(url)
             if slug:
                 tier = self._owner_map.get(slug.lower(), 'external')
                 return (slug, tier, 'origin', has_remote)
-        name = self._run_git(path, ['config', 'user.name']).strip()
+
+        # Local first, then `git config` (which sees ~/.gitconfig + XDG).
+        name = cfg.get('user', 'name', fallback='').strip() \
+            or self._run_git(path, ['config', 'user.name']).strip()
         if name:
             tier = self._owner_map.get(name.lower())
             if tier:
                 return (name, tier, 'user.name', has_remote)
-        email = self._run_git(path, ['config', 'user.email']).strip()
+        email = cfg.get('user', 'email', fallback='').strip() \
+            or self._run_git(path, ['config', 'user.email']).strip()
         if email:
             tier = self._owner_map.get(email.lower())
             if tier:
@@ -358,7 +443,9 @@ class GitEmblemsProvider(GObject.GObject,
             'identity': None, 'tier': None, 'identity_source': None,
             'has_remote': True,
         }
-        out = self._run_git(path, ['status', '--porcelain=v2', '--branch'])
+        out = self._run_git(
+            path, ['status', '--porcelain=v2', '--branch', '--no-renames'],
+        )
         for line in out.splitlines():
             if line.startswith('# branch.head '):
                 info['branch'] = line[len('# branch.head '):].strip()
@@ -403,6 +490,7 @@ class GitEmblemsProvider(GObject.GObject,
             return subprocess.check_output(
                 [GIT_BIN, '-C', path] + args,
                 stderr=subprocess.DEVNULL, timeout=GIT_TIMEOUT_SEC,
+                env=GIT_ENV,
             ).decode('utf-8', 'replace')
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
                 FileNotFoundError):
