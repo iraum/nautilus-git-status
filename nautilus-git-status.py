@@ -17,9 +17,11 @@ Tier is derived (in order of preference) from:
   2. `git config user.name` (for purely local repos with no origin)
   3. `git config user.email` (last-resort fallback)
 
-The mapping from identifier -> tier is read from
-~/.config/nautilus-git-status/profiles.conf. The file is watched via
-Gio.FileMonitor; edits take effect on the next emblem refresh.
+The mapping from identifier -> tier resolves system -> user:
+/etc/nautilus-git-status/profiles.conf is the shared base (seeded by a
+system-wide install) and ~/.config/nautilus-git-status/profiles.conf, if
+present, overlays it per-identifier. Both are watched via Gio.FileMonitor;
+edits to either take effect on the next emblem refresh.
 
 Emblems are composited by Nautilus on top of whatever icon the folder
 already has, so custom-icon PNGs (e.g. from the companion
@@ -92,9 +94,28 @@ MAX_TRACKED_REPOS = 256
 # Also avoids fighting concurrent CLI git invocations for the same lock.
 GIT_ENV = {**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}
 
-CONFIG_PATH = os.path.expanduser(
+# Ownership config resolves system -> user, lowest precedence first. The
+# system file is the shared base (one install from root seeds it for every
+# account); a per-user file, if present, overlays it per-identifier so an
+# account can override or extend the shared map without touching /etc.
+SYSTEM_CONFIG_PATH = '/etc/nautilus-git-status/profiles.conf'
+USER_CONFIG_PATH = os.path.expanduser(
     '~/.config/nautilus-git-status/profiles.conf'
 )
+CONFIG_PATHS = (SYSTEM_CONFIG_PATH, USER_CONFIG_PATH)  # later wins
+
+
+def _load_owner_map():
+    """Merge every config in CONFIG_PATHS, later paths winning per-identifier.
+
+    Missing files are skipped (_load_owner_config returns {} on OSError), so
+    an account with only the shared /etc file — or only a per-user file —
+    both resolve correctly.
+    """
+    mapping = {}
+    for path in CONFIG_PATHS:
+        mapping.update(_load_owner_config(path))
+    return mapping
 
 
 def _load_owner_config(path):
@@ -178,8 +199,8 @@ class GitEmblemsProvider(GObject.GObject,
         # dialog need richer fields than the emblem does.
         self._info_cache = OrderedDict()
         self._lock = threading.Lock()
-        self._owner_map = _load_owner_config(CONFIG_PATH)
-        self._config_monitor = None
+        self._owner_map = _load_owner_map()
+        self._config_monitors = []
         self._watch_config()
 
     # ---- Nautilus entry point ----------------------------------------------
@@ -346,23 +367,25 @@ class GitEmblemsProvider(GObject.GObject,
         return False  # don't repeat
 
     def _watch_config(self):
-        cfg_dir = os.path.dirname(CONFIG_PATH)
+        # Only the user dir is ours to create; /etc is seeded by the
+        # system installer and we may lack write perms there.
         try:
-            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(USER_CONFIG_PATH), exist_ok=True)
         except OSError:
-            return
-        try:
-            gfile = Gio.File.new_for_path(CONFIG_PATH)
-            # monitor_file fires whether or not the file currently exists, so
-            # editing or first-time-creating the config triggers a reload.
-            monitor = gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
-        except GLib.Error:
-            return
-        monitor.connect('changed', self._on_config_changed)
-        self._config_monitor = monitor
+            pass
+        for path in CONFIG_PATHS:
+            try:
+                gfile = Gio.File.new_for_path(path)
+                # monitor_file fires whether or not the file currently exists,
+                # so editing or first-time-creating either config reloads.
+                monitor = gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
+            except GLib.Error:
+                continue
+            monitor.connect('changed', self._on_config_changed)
+            self._config_monitors.append(monitor)
 
     def _on_config_changed(self, monitor, gfile, other_file, event_type):
-        self._owner_map = _load_owner_config(CONFIG_PATH)
+        self._owner_map = _load_owner_map()
         with self._lock:
             paths = list(self._files.keys())
             self._cache.clear()

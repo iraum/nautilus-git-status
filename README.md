@@ -36,7 +36,10 @@ center of the status disk identifies which of your git profiles the
 repo belongs to. The status color stays visible as a ring around it.
 Tier is resolved (in order) from the owner slug in `git remote get-url
 origin`, then `git config user.name`, then `git config user.email`.
-The mapping lives in `~/.config/nautilus-git-status/profiles.conf`
+The mapping resolves system → user: a shared base in
+`/etc/nautilus-git-status/profiles.conf` (seeded by a system-wide
+install), overlaid by a per-account
+`~/.config/nautilus-git-status/profiles.conf` if one exists
 (see [Configuring ownership](#configuring-ownership)).
 
 | Center dot | Tier      | What it means                                     |
@@ -66,8 +69,10 @@ Nautilus. No polling, no systemd timer.
 
 ## Configuring ownership
 
-`install.sh` seeds `~/.config/nautilus-git-status/profiles.conf` on
-first run. Format is one line per tier:
+`install.sh` seeds a `profiles.conf` on first run — in
+`~/.config/nautilus-git-status/` for a per-user install, or
+`/etc/nautilus-git-status/` for a system-wide one. Format is one line
+per tier:
 
 ```ini
 # Comma-separated identifiers per tier. Matched case-insensitively
@@ -79,6 +84,13 @@ tertiary  = iraum-oracle
 
 Anything not listed is rendered as `external`. Save the file and
 emblems repaint within a fraction of a second; no restart needed.
+
+**Resolution is system → user.** The extension reads
+`/etc/nautilus-git-status/profiles.conf` first as a shared base, then
+overlays `~/.config/nautilus-git-status/profiles.conf` per-identifier
+if it exists. So one system-wide config gives every account the same
+map, and any single account can override or extend it by dropping in
+its own file. Both paths are watched, so editing either repaints live.
 
 ## Right-click menu
 
@@ -121,7 +133,7 @@ sudo dnf install -y nautilus-python   # needs ol9_developer_EPEL enabled
 ./install.sh
 ```
 
-The installer copies:
+The per-user installer copies:
 
 - `nautilus-git-status.py` → `~/.local/share/nautilus-python/extensions/`
 - `icons/emblem-git-*.svg` → `~/.local/share/icons/hicolor/scalable/emblems/`
@@ -133,6 +145,37 @@ The installer copies:
 already running. Re-run the installer any time you edit
 `icons/generate.py` to regenerate the SVGs first
 (`python3 icons/generate.py`).
+
+### System-wide install (shared by every account)
+
+On a multi-account machine, install once as root so all users share one
+copy of the extension and one ownership map:
+
+```bash
+sudo dnf install -y nautilus-python   # if not already present
+sudo ./install.sh                     # --system is implied when run as root
+```
+
+System mode targets:
+
+- `nautilus-git-status.py` → `/usr/share/nautilus-python/extensions/`
+- `icons/emblem-git-*.svg` → `/usr/share/icons/hicolor/scalable/emblems/`
+- A starter `profiles.conf` → `/etc/nautilus-git-status/` (seeded only if
+  absent), which becomes the shared base every account reads.
+
+It refreshes the system icon cache but does **not** restart anyone's
+Nautilus — that would disrupt other users' sessions. Each logged-in user
+reloads to pick up the extension:
+
+```bash
+nautilus -q
+# if the surface doesn't appear (gapplication-service keeps the old
+# process alive): pkill -u $USER nautilus && sleep 1 && nautilus &
+```
+
+Any account can still override the shared map by creating its own
+`~/.config/nautilus-git-status/profiles.conf` (see
+[Configuring ownership](#configuring-ownership)).
 
 ## Migrating from git-emblems
 
@@ -199,12 +242,24 @@ staleness concerns.
 
 ## Uninstall
 
+Per-user:
+
 ```bash
 rm ~/.local/share/nautilus-python/extensions/nautilus-git-status.py
 rm ~/.local/share/icons/hicolor/scalable/emblems/emblem-git-*.svg
 rm -rf ~/.config/nautilus-git-status      # only if you also want to drop the config
 gtk-update-icon-cache -f ~/.local/share/icons/hicolor
 nautilus -q
+```
+
+System-wide (as root):
+
+```bash
+sudo rm /usr/share/nautilus-python/extensions/nautilus-git-status.py
+sudo rm /usr/share/icons/hicolor/scalable/emblems/emblem-git-*.svg
+sudo rm -rf /etc/nautilus-git-status      # only if you also want to drop the config
+sudo gtk-update-icon-cache -f /usr/share/icons/hicolor
+# each user: nautilus -q
 ```
 
 ## License

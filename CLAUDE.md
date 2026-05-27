@@ -8,8 +8,10 @@ small black-outlined inner dot encodes ownership tier (primary /
 secondary / tertiary). The 'external' tier renders as the plain status
 disk with no inner dot. The inner dot's outline switches to a bolder
 crimson stroke for tiered repos with no remote configured, so
-purely-local repos read at a glance. Tier comes from the user's
-profile config at `~/.config/nautilus-git-status/profiles.conf`.
+purely-local repos read at a glance. Tier comes from a profile config
+that resolves system → user: a shared base at
+`/etc/nautilus-git-status/profiles.conf` overlaid by a per-account
+`~/.config/nautilus-git-status/profiles.conf` if present.
 Exactly one emblem per repo; no stacking. Adds a "Git" submenu to the
 right-click context menu (headline + full breakdown, including
 identity) and a matching "Git" tab to the Properties dialog.
@@ -111,6 +113,28 @@ folder → Properties → Git for the rich view.
   variants (4 statuses × 3 tiers, with `-noremote` filename suffix),
   bringing the total to 28 emblems. The signal also surfaces in the
   menu / Properties Identity row as `iraum (primary, no remote)`.
+- **Ownership config resolves system → user (shared base + per-account
+  overlay).** `CONFIG_PATHS = (/etc/nautilus-git-status/profiles.conf,
+  ~/.config/nautilus-git-status/profiles.conf)`, loaded lowest→highest
+  precedence by `_load_owner_map()` so a per-user file overlays the
+  shared `/etc` base per-identifier. This exists so a single
+  system-wide install (run as root) gives every account on a machine
+  the same tier map without per-user setup, while still letting any one
+  account override it by dropping in its own file. Both paths are
+  watched via `Gio.FileMonitor` (`monitor_file` fires even for
+  not-yet-existing files), so editing either repaints live. We only
+  `os.makedirs` the *user* dir — `/etc` is the installer's to create,
+  and a normal-user session won't have write perms there.
+- **`install.sh` has a system-wide mode** (run as root, or
+  `--system`). It targets `/usr/share/nautilus-python/extensions/`,
+  `/usr/share/icons/hicolor/scalable/emblems/`, and seeds
+  `/etc/nautilus-git-status/profiles.conf`. It deliberately does **not**
+  restart Nautilus in system mode — killing other users' sessions from a
+  root install is a surprising side effect; each user reloads their own
+  Nautilus. The per-user mode (default, no root) is unchanged. The
+  canonical system extensions dir is `/usr/share/nautilus-python/extensions`
+  (nautilus-python also scans `/usr/lib64/nautilus-python/extensions`);
+  confirm against the installed package if emblems don't load.
 - **`icons/generate.py` is the source of truth for emblem artwork.**
   Edit colors / ring widths / dot radii there, run
   `python3 icons/generate.py` from the `icons/` directory, and the
