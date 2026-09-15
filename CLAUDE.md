@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # nautilus-git-status
 
 A Nautilus Python extension that overlays a single live git emblem on
@@ -48,6 +52,34 @@ sudo dnf install -y nautilus-python   # one-time; ol9_developer_EPEL
 
 Open any parent folder in Nautilus to see the dots; right-click a repo
 folder → Properties → Git for the rich view.
+
+## Development
+
+No build step, no automated tests, no linter — the extension is a single
+Python file Nautilus loads directly. The iterate loop:
+
+```bash
+# Regenerate the 28 emblem SVGs after editing colors / ring widths /
+# dot radii in the generator (must run from the icons/ directory).
+cd icons && python3 generate.py && cd ..
+
+# Syntax-check the extension before installing.
+python3 -m py_compile nautilus-git-status.py
+
+# Install the working copy (per-user) and bounce Nautilus.
+./install.sh
+
+# System-wide install (one shared copy + /etc config for all accounts).
+sudo ./install.sh
+
+# Force a clean reload when new code doesn't appear (gapplication-service
+# can keep the old extension loaded — see design notes below).
+pkill -u $USER nautilus && sleep 1 && nautilus &
+```
+
+Verification is manual (there is no test harness): open a parent folder of
+git repos in Nautilus and check the emblem, the right-click **Git** submenu,
+and the **Properties → Git** tab against repos in each ownership tier.
 
 ## Dependencies
 
